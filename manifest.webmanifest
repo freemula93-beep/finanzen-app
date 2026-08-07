@@ -1,0 +1,15 @@
+{
+  "name": "Meine Finanzen",
+  "short_name": "Finanzen",
+  "description": "Übersicht über Einnahmen, Ausgaben und Sparpotenzial – alle Daten bleiben lokal auf deinem Gerät.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f172a",
+  "theme_color": "#0f172a",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}

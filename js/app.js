@@ -2,6 +2,8 @@ import { DB } from './db.js';
 import { DEFAULT_CATEGORIES, DEFAULT_RULES, categorizeDescription } from './categorize.js';
 import { parseCsv, parseAmount, parseDate, rowHash, guessMapping } from './csvImport.js';
 import { drawBarChart, drawDonutChart } from './charts.js';
+import { extractPdfTransactions } from './pdfImport.js';
+import { extractReceiptData } from './receiptImport.js';
 
 const state = {
   view: 'dashboard',
@@ -9,7 +11,8 @@ const state = {
   categories: [],
   rules: [],
   transactions: [],
-  importDraft: null, // { headers, rows, delimiter, mapping, invert }
+  importDraft: null, // { kind: 'csv'|'pdf'|'receipt', ... }
+  importLoading: null, // Ladetext, während PDF/Foto verarbeitet wird
   txSearch: '',
 };
 
@@ -282,17 +285,23 @@ function renderTransactions() {
 // ---------- Import ----------
 
 function renderImport() {
+  if (state.importLoading) {
+    viewRoot.innerHTML = `<div class="card"><div class="empty-state">⏳ ${escapeHtml(state.importLoading)}</div></div>`;
+    return;
+  }
+
   if (!state.importDraft) {
     viewRoot.innerHTML = `
       <div class="card">
-        <h2>Kontoauszug importieren</h2>
+        <h2>Beleg oder Kontoauszug importieren</h2>
         <label class="dropzone" id="dropzone" for="csv-input">
-          <div>📄 CSV-Datei hierher ziehen<br/>oder tippen zum Auswählen</div>
-          <input type="file" id="csv-input" accept=".csv,text/csv" style="display:none" />
+          <div>📄 Datei hierher ziehen<br/>oder tippen zum Auswählen</div>
+          <input type="file" id="csv-input" accept=".csv,text/csv,.pdf,application/pdf,image/jpeg,image/png" style="display:none" />
         </label>
         <div style="font-size:12px;color:var(--text-dim);line-height:1.5">
-          Exportiere im Online-Banking deiner Bank einen Kontoauszug als CSV-Datei und wähle sie hier aus.
-          Du kannst die Spalten im nächsten Schritt selbst zuordnen – jedes Bankformat funktioniert.
+          Unterstützt werden <b>CSV</b>-Kontoauszüge (Spalten frei zuordenbar), <b>PDF</b>-Kontoauszüge (Text wird automatisch erkannt)
+          und Fotos von Belegen (<b>JPEG/PNG</b>, per Texterkennung). Die PDF- und Foto-Erkennung ist Best-Effort – bitte die
+          erkannten Daten vor dem Speichern prüfen. Dafür wird einmalig eine Erkennungs-Bibliothek geladen, also kurz Internet nötig.
         </div>
       </div>
     `;
@@ -309,6 +318,12 @@ function renderImport() {
   }
 
   const d = state.importDraft;
+  if (d.kind === 'pdf') return renderPdfReview(d);
+  if (d.kind === 'receipt') return renderReceiptReview(d);
+  return renderCsvMapping(d);
+}
+
+function renderCsvMapping(d) {
   const colOptions = (selected) => d.headers.map((h, i) => `<option value="${i}" ${i === selected ? 'selected' : ''}>${escapeHtml(h)}</option>`).join('') + `<option value="-1" ${selected === -1 || selected === undefined ? 'selected' : ''}>– keine –</option>`;
 
   const previewRows = d.rows.slice(0, 5);
@@ -370,25 +385,210 @@ function renderImport() {
     state.importDraft = null;
     render();
   });
-  document.getElementById('import-confirm').addEventListener('click', doImport);
+  document.getElementById('import-confirm').addEventListener('click', doCsvImport);
 }
 
 function handleFile(file) {
-  const reader = new FileReader();
-  reader.onload = () => {
-    const { headers, rows } = parseCsv(String(reader.result));
-    if (headers.length === 0) {
-      toast('CSV konnte nicht gelesen werden');
-      return;
-    }
-    const mapping = guessMapping(headers);
-    state.importDraft = { headers, rows, mapping, invert: false };
+  const name = file.name.toLowerCase();
+
+  if (name.endsWith('.csv') || file.type === 'text/csv') {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const { headers, rows } = parseCsv(String(reader.result));
+      if (headers.length === 0) {
+        toast('CSV konnte nicht gelesen werden');
+        return;
+      }
+      const mapping = guessMapping(headers);
+      state.importDraft = { kind: 'csv', headers, rows, mapping, invert: false };
+      render();
+    };
+    reader.readAsText(file, 'utf-8');
+    return;
+  }
+
+  if (name.endsWith('.pdf') || file.type === 'application/pdf') {
+    state.importLoading = 'PDF wird analysiert…';
     render();
-  };
-  reader.readAsText(file, 'utf-8');
+    extractPdfTransactions(file)
+      .then((txs) => {
+        state.importLoading = null;
+        if (txs.length === 0) {
+          toast('Es konnten keine Buchungen im PDF erkannt werden');
+          render();
+          return;
+        }
+        state.importDraft = { kind: 'pdf', rows: txs, invert: false };
+        render();
+      })
+      .catch((err) => {
+        state.importLoading = null;
+        toast(err.message || 'PDF konnte nicht gelesen werden');
+        render();
+      });
+    return;
+  }
+
+  if (file.type.startsWith('image/') || /\.(jpe?g|png)$/i.test(name)) {
+    state.importLoading = 'Beleg wird erkannt (OCR)…';
+    render();
+    extractReceiptData(file)
+      .then((res) => {
+        state.importLoading = null;
+        state.importDraft = { kind: 'receipt', ...res };
+        render();
+      })
+      .catch((err) => {
+        state.importLoading = null;
+        toast(err.message || 'Beleg konnte nicht gelesen werden');
+        render();
+      });
+    return;
+  }
+
+  toast('Nicht unterstütztes Dateiformat');
 }
 
-async function doImport() {
+// ---------- PDF-Review ----------
+
+function renderPdfReview(d) {
+  viewRoot.innerHTML = `
+    <div class="card">
+      <h2>PDF-Buchungen prüfen (${d.rows.length})</h2>
+      <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px">
+        Die Erkennung ist nicht perfekt – bitte Datum, Text und Betrag kontrollieren und bei Bedarf korrigieren oder Zeilen löschen.
+      </div>
+      <div id="pdf-rows">${d.rows.map(pdfRowHtml).join('')}</div>
+      <button class="btn secondary" id="pdf-add-row" style="margin-bottom:14px">+ Zeile hinzufügen</button>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-dim);margin-bottom:14px">
+        <input type="checkbox" id="pdf-invert" ${d.invert ? 'checked' : ''}/> Alle Beträge invertieren
+      </label>
+      <div class="btn-row">
+        <button class="btn secondary" id="import-cancel">Abbrechen</button>
+        <button class="btn" id="pdf-import-confirm">Importieren</button>
+      </div>
+    </div>
+  `;
+
+  function pdfRowHtml(r, i) {
+    return `
+      <div class="rule-row" data-i="${i}" style="flex-wrap:wrap;gap:6px">
+        <input type="date" class="pdf-date" data-i="${i}" value="${r.date || ''}" style="flex:1 1 130px" />
+        <input type="text" class="pdf-desc" data-i="${i}" value="${escapeAttr(r.description)}" style="flex:2 1 140px" />
+        <input type="number" step="0.01" class="pdf-amount" data-i="${i}" value="${r.amount}" style="flex:1 1 90px" />
+        <button class="icon-btn pdf-del" data-i="${i}">✕</button>
+      </div>
+    `;
+  }
+
+  function rebindRows() {
+    viewRoot.querySelectorAll('.pdf-date').forEach((el) => el.addEventListener('input', () => { d.rows[Number(el.dataset.i)].date = el.value; }));
+    viewRoot.querySelectorAll('.pdf-desc').forEach((el) => el.addEventListener('input', () => { d.rows[Number(el.dataset.i)].description = el.value; }));
+    viewRoot.querySelectorAll('.pdf-amount').forEach((el) => el.addEventListener('input', () => { d.rows[Number(el.dataset.i)].amount = el.value; }));
+    viewRoot.querySelectorAll('.pdf-del').forEach((el) => el.addEventListener('click', () => {
+      d.rows.splice(Number(el.dataset.i), 1);
+      renderPdfReview(d);
+    }));
+  }
+  rebindRows();
+
+  document.getElementById('pdf-add-row').addEventListener('click', () => {
+    d.rows.push({ date: '', description: '', amount: 0 });
+    renderPdfReview(d);
+  });
+  document.getElementById('pdf-invert').addEventListener('change', (e) => { d.invert = e.target.checked; });
+  document.getElementById('import-cancel').addEventListener('click', () => { state.importDraft = null; render(); });
+  document.getElementById('pdf-import-confirm').addEventListener('click', doPdfImport);
+}
+
+async function doPdfImport() {
+  const d = state.importDraft;
+  const existingHashes = new Set(state.transactions.map((t) => t.hash));
+  const toInsert = [];
+  let skipped = 0;
+
+  for (const r of d.rows) {
+    if (!r.date) continue;
+    let amount = Number(r.amount);
+    if (isNaN(amount)) continue;
+    if (d.invert) amount = -amount;
+    const description = (r.description || '').trim() || 'PDF-Buchung';
+
+    const hash = rowHash(r.date, amount, description);
+    if (existingHashes.has(hash)) {
+      skipped++;
+      continue;
+    }
+    existingHashes.add(hash);
+
+    const category = categorizeDescription(description, state.rules) || (amount > 0 ? 'Sonstige Einnahmen' : 'Sonstiges');
+    toInsert.push({ date: r.date, description, amount, category, hash, importedAt: new Date().toISOString() });
+  }
+
+  if (toInsert.length > 0) await DB.bulkAdd('transactions', toInsert);
+  await loadAll();
+  state.importDraft = null;
+  state.view = 'dashboard';
+  render();
+  toast(`${toInsert.length} Buchungen importiert${skipped ? `, ${skipped} Duplikate übersprungen` : ''}`);
+}
+
+// ---------- Beleg-Review (OCR) ----------
+
+function renderReceiptReview(d) {
+  const catOptions = state.categories.filter((c) => c.type === 'expense').map((c) => `<option value="${c.name}">${c.name}</option>`).join('');
+  const guessedCat = categorizeDescription(d.merchant, state.rules) || 'Sonstiges';
+
+  viewRoot.innerHTML = `
+    <div class="card">
+      <h2>Beleg erkannt</h2>
+      <div style="font-size:12px;color:var(--text-dim);margin-bottom:10px">Bitte Angaben prüfen und bei Bedarf korrigieren.</div>
+      <div class="mapping-grid">
+        <div><label class="field-label">Händler / Beschreibung</label><input type="text" id="r-desc" value="${escapeAttr(d.merchant || '')}" /></div>
+        <div><label class="field-label">Datum</label><input type="date" id="r-date" value="${d.date || ''}" /></div>
+        <div><label class="field-label">Betrag (€)</label><input type="number" step="0.01" min="0" id="r-amount" value="${d.amount != null ? d.amount : ''}" /></div>
+        <div><label class="field-label">Kategorie</label><select id="r-cat">${catOptions}</select></div>
+      </div>
+      <details style="margin-bottom:14px">
+        <summary style="cursor:pointer;color:var(--text-dim);font-size:12px">Erkannten Text anzeigen</summary>
+        <pre style="white-space:pre-wrap;font-size:11px;color:var(--text-dim);margin-top:8px">${escapeHtml(d.rawText || '')}</pre>
+      </details>
+      <div class="btn-row">
+        <button class="btn secondary" id="import-cancel">Abbrechen</button>
+        <button class="btn" id="receipt-confirm">Als Ausgabe speichern</button>
+      </div>
+    </div>
+  `;
+
+  const catSelect = document.getElementById('r-cat');
+  if ([...catSelect.options].some((o) => o.value === guessedCat)) catSelect.value = guessedCat;
+
+  document.getElementById('import-cancel').addEventListener('click', () => { state.importDraft = null; render(); });
+  document.getElementById('receipt-confirm').addEventListener('click', async () => {
+    const date = document.getElementById('r-date').value;
+    const description = document.getElementById('r-desc').value.trim() || 'Beleg';
+    const amountAbs = parseFloat(document.getElementById('r-amount').value);
+    const category = catSelect.value;
+    if (!date || isNaN(amountAbs)) {
+      toast('Bitte Datum und Betrag angeben');
+      return;
+    }
+    const amount = -Math.abs(amountAbs);
+    const hash = rowHash(date, amount, description);
+    if (state.transactions.some((t) => t.hash === hash)) {
+      toast('Diese Buchung scheint bereits zu existieren');
+      return;
+    }
+    await DB.add('transactions', { date, description, amount, category, hash, importedAt: new Date().toISOString() });
+    await loadAll();
+    state.importDraft = null;
+    state.view = 'dashboard';
+    render();
+    toast('Beleg gespeichert');
+  });
+}
+
+async function doCsvImport() {
   const d = state.importDraft;
   const { mapping, rows, invert } = d;
   if (mapping.date === -1 || mapping.date === undefined) {

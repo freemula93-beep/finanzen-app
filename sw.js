@@ -9,6 +9,9 @@ const ASSETS = [
   './js/csvImport.js',
   './js/categorize.js',
   './js/charts.js',
+  './js/loader.js',
+  './js/pdfImport.js',
+  './js/receiptImport.js',
   './icons/icon.svg',
 ];
 

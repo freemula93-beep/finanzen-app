@@ -1,4 +1,4 @@
-const CACHE = 'finanzen-cache-v1';
+const CACHE = 'finanzen-cache-v2';
 const ASSETS = [
   './',
   './index.html',
@@ -28,20 +28,21 @@ self.addEventListener('activate', (event) => {
   );
 });
 
+// Netzwerk zuerst (own-origin), damit App-Updates sofort ankommen; Cache dient nur als
+// Offline-Fallback. Cross-origin Requests (CDN-Bibliotheken für PDF/OCR) unangetastet lassen.
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
+  if (new URL(event.request.url).origin !== self.location.origin) return;
+
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      const fetchPromise = fetch(event.request)
-        .then((networkResponse) => {
-          if (networkResponse && networkResponse.status === 200) {
-            const clone = networkResponse.clone();
-            caches.open(CACHE).then((cache) => cache.put(event.request, clone));
-          }
-          return networkResponse;
-        })
-        .catch(() => cached);
-      return cached || fetchPromise;
-    })
+    fetch(event.request)
+      .then((networkResponse) => {
+        if (networkResponse && networkResponse.status === 200) {
+          const clone = networkResponse.clone();
+          caches.open(CACHE).then((cache) => cache.put(event.request, clone));
+        }
+        return networkResponse;
+      })
+      .catch(() => caches.match(event.request))
   );
 });
